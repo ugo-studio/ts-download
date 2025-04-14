@@ -25,10 +25,14 @@ tsdl Tool is a cross‑platform command‑line utility designed to download and 
 ## Repository Structure
 
 ts-download/ 
-    ├── LICENSE 
-    ├── README.md           
-    ├── tsdl                # Main script (executable Bash script) 
-    └── install.py          # Cross‑platform installer script (Python)
+            
+        ├── LICENSE 
+            
+        ├── README.md           
+            
+        ├── tsdl                # Main script (executable Bash script) 
+            
+        └── install.py          # Cross‑platform installer script (Python)
 
 ## Requirements
 
@@ -91,22 +95,22 @@ Once installed, the tool can be run from any terminal or command prompt. For exa
 tsdl https://example.com/path/to/playlist.m3u8 [output_file_path]
 ```
 
-### URL: Provide the HLS playlist URL (or master playlist URL).
+- **URL:** Provide the HLS playlist URL (or master playlist URL).
 
-### output_file_path (optional): Specify the final video file’s output path. This path must end with a valid video extension such as .mp4, .mkv, .avi, .mov, or .flv. If not provided, the tool defaults to saving the video as ./downloads/output.mp4.
+- **output_file_path (optional):** Specify the final video file’s output path. This path must end with a valid video extension such as .mp4, .mkv, .avi, .mov, or .flv. If not provided, the tool defaults to saving the video as ./downloads/output.mp4.
 
 
 During the download process, the tool will display progress and allow you to resume downloads if interrupted. After combining the TS segments into the final video, you will be prompted whether to remove the temporary directory that held the TS files.
 
 ## Troubleshooting
 
-### FFmpeg Errors:
+- **FFmpeg Errors:**
 Ensure that FFmpeg is installed and in your system PATH. Check the FFmpeg version if you encounter any conversion issues.
 
-### Permissions Issues (Linux/macOS/Termux):
+- *Permissions Issues (Linux/macOS/Termux):*
 If the installer complains about permissions for the target directory, make sure you have the proper rights, or run the installer with sudo (if not in a Termux environment).
 
-### Windows PATH Update:
+- *Windows PATH Update:*
 If the installer could not automatically update your PATH, you may need to add the installation directory (e.g., %LOCALAPPDATA%\tsdl-tool) to your PATH manually.
 
 
