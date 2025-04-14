@@ -1,0 +1,181 @@
+#!/bin/bash
+# tsdl - Download TS segments from an HLS playlist and combine them into a video.
+
+# Usage: tsdl <URL> [output_file_path]
+if [[ -z "$1" ]]; then
+    echo "Usage: $0 <URL> [output_file_path]"
+    exit 1
+fi
+
+URL="$1"
+
+# Determine output file path; if not provided, default to ./downloads/output.mp4
+if [[ -n "$2" ]]; then
+    OUTPUT_PATH="$2"
+else
+    OUTPUT_DIR="./downloads"
+    mkdir -p "$OUTPUT_DIR"
+    OUTPUT_PATH="$OUTPUT_DIR/output.mp4"
+fi
+
+# Check that OUTPUT_PATH ends with a valid video file extension.
+if [[ ! "$OUTPUT_PATH" =~ \.(mp4|MP4|mkv|MKV|avi|AVI|mov|MOV|flv|FLV)$ ]]; then
+    echo "Error: The output file must have a valid video extension (e.g., .mp4, .mkv, .avi, .mov, .flv)."
+    exit 1
+fi
+
+# Extract output name
+OUTPUT_DIR=$(dirname "$OUTPUT_PATH")
+OUTPUT_FILENAME=$(basename "$OUTPUT_PATH")
+OUTPUT_NAME="${OUTPUT_FILENAME%.*}"
+
+# Create temporary directory for cache files: add .temp suffix to output path
+TMP_DIR="${OUTPUT_PATH}.temp"
+mkdir -p "$TMP_DIR"
+
+STATE_FILE="$TMP_DIR/${OUTPUT_NAME}_state.txt"
+MAX_RETRIES=10
+
+# Resume progress if state file exists
+COMPLETED_FILES=0
+if [[ -f "$STATE_FILE" ]]; then
+    COMPLETED_FILES=$(cat "$STATE_FILE")
+    echo "Resuming from file $COMPLETED_FILES..."
+else
+    echo "0" > "$STATE_FILE"
+fi
+
+# Fetch playlist and allow resolution selection if this is a master playlist
+echo "Fetching playlist..."
+MASTER_CONTENT=$(curl -s "$URL" | tr -d '\r')
+if echo "$MASTER_CONTENT" | grep -q "#EXT-X-STREAM-INF"; then
+    echo "Detected master playlist. Available resolutions:"
+    declare -a res_array
+    declare -a url_array
+    idx=0
+    while IFS= read -r line; do
+        line=$(echo "$line" | tr -d '\r')
+        if [[ $line == \#EXT-X-STREAM-INF* ]]; then
+            resolution=$(echo "$line" | sed -nE 's/.*RESOLUTION=([^,]*).*/\1/p')
+            res_array[idx]="$resolution"
+            read -r next_line
+            next_line=$(echo "$next_line" | tr -d '\r')
+            url_array[idx]="$next_line"
+            idx=$((idx+1))
+        fi
+    done <<< "$MASTER_CONTENT"
+
+    for i in "${!res_array[@]}"; do
+        echo "$((i+1)): ${res_array[i]}"
+    done
+
+    echo -n "Enter your choice: "
+    read choice
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#res_array[@]} )); then
+        echo "Invalid choice. Exiting."
+        exit 1
+    fi
+
+    selected_index=$((choice - 1))
+    PLAYLIST_URL="${url_array[selected_index]}"
+    if [[ "$PLAYLIST_URL" != http* ]]; then
+        if [[ "$PLAYLIST_URL" == /* ]]; then
+            PLAYLIST_URL="$(echo "$URL" | sed -E 's|(https?://[^/]+).*|\1|')$PLAYLIST_URL"
+        else
+            PLAYLIST_URL="$(dirname "$URL")/$PLAYLIST_URL"
+        fi
+    fi
+    echo "Selected resolution: ${res_array[selected_index]} with playlist: $PLAYLIST_URL"
+else
+    PLAYLIST_URL="$URL"
+fi
+
+echo "Fetching TS file URLs from playlist..."
+TS_URLS=$(curl -s "$PLAYLIST_URL" | tr -d '\r' | grep -v '^#')
+TOTAL_FILES=$(echo "$TS_URLS" | wc -l)
+echo "Found $TOTAL_FILES TS files in the playlist."
+
+# Download each TS segment as a separate file.
+echo "Starting download of $TOTAL_FILES files..."
+declare -a TS_FILES
+
+CURRENT_FILE=0
+for TS_URL in $TS_URLS; do
+    if [[ "$TS_URL" != http* ]]; then
+        if [[ "$TS_URL" == /* ]]; then
+            BASE=$(echo "$PLAYLIST_URL" | sed -E 's|(https?://[^/]+).*|\1|')
+            TS_URL="$BASE$TS_URL"
+        else
+            TS_URL="$(dirname "$PLAYLIST_URL")/$TS_URL"
+        fi
+    fi
+
+    CURRENT_FILE=$((CURRENT_FILE + 1))
+    if [[ $CURRENT_FILE -le $COMPLETED_FILES ]]; then
+        echo "Skipping file $CURRENT_FILE (already downloaded)."
+        TS_FILES+=("$TMP_DIR/${OUTPUT_NAME}_part_${CURRENT_FILE}.ts")
+        continue
+    fi
+
+    TEMP_FILE="$TMP_DIR/${OUTPUT_NAME}_part_${CURRENT_FILE}.ts"
+    echo "Downloading: $TS_URL ($CURRENT_FILE/$TOTAL_FILES)"
+
+    ATTEMPT=0
+    SUCCESS=0
+    while [[ $ATTEMPT -lt $MAX_RETRIES ]]; do
+        ATTEMPT=$((ATTEMPT + 1))
+        curl -s "$TS_URL" --output "$TEMP_FILE"
+        if [[ $? -eq 0 && -s "$TEMP_FILE" ]]; then
+            SUCCESS=1
+            break
+        fi
+        echo "Retry $ATTEMPT/$MAX_RETRIES failed for $TS_URL. Retrying..."
+    done
+
+    if [[ $SUCCESS -ne 1 ]]; then
+        echo "Failed to download $TS_URL after $MAX_RETRIES attempts. Skipping..."
+        continue
+    fi
+
+    if [[ -f "$TEMP_FILE" && -s "$TEMP_FILE" ]]; then
+        echo "File $CURRENT_FILE downloaded: $TEMP_FILE"
+        TS_FILES+=("$TEMP_FILE")
+    else
+        echo "File $CURRENT_FILE is empty or missing. Skipping."
+        continue
+    fi
+
+    echo "$CURRENT_FILE" > "$STATE_FILE"
+    PERCENTAGE=$((CURRENT_FILE * 100 / TOTAL_FILES))
+    DOWNLOADED_MB=$(du -m "$TEMP_FILE" | cut -f1)
+    echo "Progress: $PERCENTAGE% | Last file downloaded: ${DOWNLOADED_MB}MB"
+done
+
+# Create a concat list file to combine the TS segments.
+CONCAT_LIST="$TMP_DIR/concat_list.txt"
+echo "Generating concat list file..."
+> "$CONCAT_LIST"
+for file in $(ls "$TMP_DIR" | grep "${OUTPUT_NAME}_part_.*\.ts" | sort -V); do
+    echo "file '$TMP_DIR/$file'" >> "$CONCAT_LIST"
+done
+
+echo "Combining TS segments into MP4..."
+ffmpeg -y -f concat -safe 0 -i "$CONCAT_LIST" -c copy "$OUTPUT_PATH"
+
+if [[ $? -eq 0 ]]; then
+    echo "Conversion complete! Output: $OUTPUT_PATH"
+else
+    echo "Conversion failed!"
+fi
+
+# Ask whether to delete the temporary directory.
+echo -n "Do you want to delete the temporary directory ($TMP_DIR)? (y/N): "
+read remove_choice
+if [[ "$remove_choice" =~ ^[Yy]$ ]]; then
+    rm -rf "$TMP_DIR"
+    echo "Temporary directory removed."
+else
+    echo "Temporary directory retained at: $TMP_DIR"
+fi
+
+echo "Process finished."
