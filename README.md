@@ -24,15 +24,11 @@ tsdl Tool is a cross‑platform command‑line utility designed to download and 
 
 ## Repository Structure
 
-ts-download/ 
-            
-        ├── LICENSE 
-            
-        ├── README.md           
-            
-        ├── tsdl                # Main script (executable Bash script) 
-            
-        └── install.py          # Cross‑platform installer script (Python)
+ts-download/             
+        ├── LICENSE             
+        ├── README.md                       
+        ├── tsdl        # Main script (executable Bash script)             
+        └── install.py  # Cross‑platform installer script (Python)
 
 ## Requirements
 
