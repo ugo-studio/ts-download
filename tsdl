@@ -1,6 +1,6 @@
 #!/bin/bash
 # tsdl - Download TS segments from an HLS playlist and combine them into a video,
-#       while tracking and displaying the total downloaded size.
+#       while tracking and displaying the total downloaded size in-place.
 
 # Usage: tsdl <URL> [output_file_path]
 if [[ -z "$1" ]]; then
@@ -121,35 +121,38 @@ for TS_URL in $TS_URLS; do
     fi
     CURRENT_FILE=$((CURRENT_FILE+1))
     if (( CURRENT_FILE <= COMPLETED_FILES )); then
-        echo "Skipping file $CURRENT_FILE (already downloaded)."
+        printf "\rProgress: %3d%% | Files: %d/%d | Total: %dMB" $((COMPLETED_FILES*100/TOTAL_FILES)) $CURRENT_FILE $TOTAL_FILES $((TOTAL_BYTES/1024/1024))
         TS_FILES+=("$TMP_DIR/${OUTPUT_NAME}_part_${CURRENT_FILE}.ts")
         continue
     fi
     TEMP_FILE="$TMP_DIR/${OUTPUT_NAME}_part_${CURRENT_FILE}.ts"
-    echo "Downloading: $TS_URL ($CURRENT_FILE/$TOTAL_FILES)"
 
+    # Download segment
     ATTEMPT=0; SUCCESS=0
     while (( ATTEMPT < MAX_RETRIES )); do
         ((ATTEMPT++))
         curl -s "$TS_URL" --output "$TEMP_FILE"
         [[ $? -eq 0 && -s "$TEMP_FILE" ]] && { SUCCESS=1; break; }
-        echo "Retry $ATTEMPT/$MAX_RETRIES failed for $TS_URL"
     done
     if (( SUCCESS != 1 )); then
-        echo "Failed after $MAX_RETRIES attempts. Skipping..."
+        echo "\nFailed to download segment $CURRENT_FILE after $MAX_RETRIES attempts. Skipping."
         continue
     fi
-    echo "File $CURRENT_FILE downloaded: $TEMP_FILE"
-    TS_FILES+=("$TEMP_FILE")
 
-    # Update state and size tracking
-    echo "$CURRENT_FILE" > "$STATE_FILE"
+    # Track downloaded bytes and update state
     FILE_BYTES=$(stat -c%s "$TEMP_FILE" 2>/dev/null || stat -f%z "$TEMP_FILE")
     TOTAL_BYTES=$((TOTAL_BYTES + FILE_BYTES))
-    TOTAL_MB=$((TOTAL_BYTES / 1024 / 1024))
-    PERCENT=$((CURRENT_FILE * 100 / TOTAL_FILES))
-    echo "Progress: $PERCENT% | Last file: $((FILE_BYTES/1024/1024))MB | Total: ${TOTAL_MB}MB"
+    printf "\rProgress: %3d%% | Files: %d/%d | Last: %4dMB | Total: %dMB" \
+        $((CURRENT_FILE*100/TOTAL_FILES)) $CURRENT_FILE $TOTAL_FILES $((FILE_BYTES/1024/1024)) $((TOTAL_BYTES/1024/1024))
+
+    # Save state
+    echo "$CURRENT_FILE" > "$STATE_FILE"
+
+    TS_FILES+=("$TEMP_FILE")
 done
+
+# Ensure the final progress line ends with a newline
+echo ""
 
 # Concat list and merge
 CONCAT_LIST="$TMP_DIR/concat_list.txt"
@@ -161,11 +164,8 @@ done
 
 echo "Combining TS segments into final video..."
 ffmpeg -y -f concat -safe 0 -i "$CONCAT_LIST" -c copy "$OUTPUT_PATH"
-if [[ $? -eq 0 ]]; then
-    echo "Conversion complete: $OUTPUT_PATH"
-else
-    echo "Conversion failed."
-fi
+
+echo "Conversion finished: $OUTPUT_PATH"
 
 # Cleanup prompt
 echo -n "Delete temporary directory ($TMP_DIR)? (y/N): "
@@ -174,7 +174,8 @@ if [[ "$resp" =~ ^[Yy]$ ]]; then
     rm -rf "$TMP_DIR"
     echo "Temporary directory removed."
 else
-    echo "Temp directory retained at: $TMP_DIR"
+    echo "Temporary directory retained at: $TMP_DIR"
 fi
 
 echo "Process finished."
+
