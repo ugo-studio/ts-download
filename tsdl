@@ -121,7 +121,8 @@ for TS_URL in $TS_URLS; do
     fi
     CURRENT_FILE=$((CURRENT_FILE+1))
     if (( CURRENT_FILE <= COMPLETED_FILES )); then
-        printf "\rProgress: %3d%% | Files: %d/%d | Total: %dMB" $((COMPLETED_FILES*100/TOTAL_FILES)) $CURRENT_FILE $TOTAL_FILES $((TOTAL_BYTES/1024/1024))
+        printf "\rProgress: %3d%% | Files: %d/%d | Total: %dMB" \
+          $((COMPLETED_FILES*100/TOTAL_FILES)) $CURRENT_FILE $TOTAL_FILES $((TOTAL_BYTES/1024/1024))
         TS_FILES+=("$TMP_DIR/${OUTPUT_NAME}_part_${CURRENT_FILE}.ts")
         continue
     fi
@@ -154,16 +155,24 @@ done
 # Ensure the final progress line ends with a newline
 echo ""
 
-# Concat list and merge
-CONCAT_LIST="$TMP_DIR/concat_list.txt"
-echo "Generating concat list file..."
-> "$CONCAT_LIST"
-for f in $(ls "$TMP_DIR" | grep "${OUTPUT_NAME}_part_.*\.ts" | sort -V); do
-    echo "file '$TMP_DIR/$f'" >> "$CONCAT_LIST"
+# ── NEW CONCAT & MERGE SECTION ──
+echo "Generating concat list (just basenames) and merging..."
+
+pushd "$TMP_DIR" > /dev/null
+
+# Create a simple concat_list.txt with only TS filenames
+> concat_list.txt
+for seg in ${OUTPUT_NAME}_part_*.ts; do
+    echo "file '$seg'" >> concat_list.txt
 done
 
-echo "Combining TS segments into final video..."
-ffmpeg -y -f concat -safe 0 -i "$CONCAT_LIST" -c copy "$OUTPUT_PATH"
+# Run ffmpeg from inside the temp dir; output goes one level up
+ffmpeg -y -f concat -safe 0 \
+    -i concat_list.txt \
+    -c copy "../${OUTPUT_FILENAME}"
+
+popd > /dev/null
+# ────────────────────────────────
 
 echo "Conversion finished: $OUTPUT_PATH"
 
@@ -178,4 +187,3 @@ else
 fi
 
 echo "Process finished."
-
