@@ -44,6 +44,9 @@ if [[ -f "$STATE_FILE" ]]; then
     for ((i=1; i<=COMPLETED_FILES; i++)); do
         f="$TMP_DIR/${OUTPUT_NAME}_part_${i}.ts"
         [[ -f "$f" ]] && TOTAL_BYTES=$((TOTAL_BYTES + $(stat -c%s "$f" 2>/dev/null || stat -f%z "$f")))
+        # Update progress bar
+        TOTAL_MB=$((TOTAL_BYTES / 1024 / 1024))
+        printf "\rCalculating total segment size: %4dMB in %4d files\r" $TOTAL_MB $COMPLETED_FILES
     done
     echo "Already downloaded: $((TOTAL_BYTES/1024/1024))MB in $COMPLETED_FILES files."
 else
@@ -138,11 +141,25 @@ echo
 # 5) Concat & merge (Option A)
 echo "Combining segments..."
 pushd "$TMP_DIR" >/dev/null
+
+# Create a properly version‐sorted concat list:
 > concat_list.txt
-for seg in ${OUTPUT_NAME}_part_*.ts; do
+# Option A: use ls -1v (version sort) if available
+for seg in $(ls -1v ${OUTPUT_NAME}_part_*.ts); do
     echo "file '$seg'"
 done >> concat_list.txt
-ffmpeg -y -f concat -safe 0 -i concat_list.txt -c copy "../${OUTPUT_FILENAME}"
+
+# (Alternatively, fallback to sort -V on the glob list:
+# for seg in $(printf "%s\n" ${OUTPUT_NAME}_part_*.ts | sort -V); do
+#     echo "file '$seg'"
+# done >> concat_list.txt
+# )
+
+# Now merge:
+ffmpeg -y -f concat -safe 0 \
+    -i concat_list.txt \
+    -c copy "../${OUTPUT_FILENAME}"
+
 popd >/dev/null
 
 echo "Conversion finished: $OUTPUT_PATH"
