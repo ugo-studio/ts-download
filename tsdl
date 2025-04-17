@@ -19,171 +19,141 @@ else
     OUTPUT_PATH="$OUTPUT_DIR/output.mp4"
 fi
 
-# Check that OUTPUT_PATH ends with a valid video file extension.
+# Validate extension
 if [[ ! "$OUTPUT_PATH" =~ \.(mp4|MP4|mkv|MKV|avi|AVI|mov|MOV|flv|FLV)$ ]]; then
-    echo "Error: The output file must have a valid video extension (e.g., .mp4, .mkv, .avi, .mov, .flv)."
+    echo "Error: The output file must have a valid video extension."
     exit 1
 fi
 
-# Extract names
+# Names & temp dir
 OUTPUT_DIR=$(dirname "$OUTPUT_PATH")
 OUTPUT_FILENAME=$(basename "$OUTPUT_PATH")
 OUTPUT_NAME="${OUTPUT_FILENAME%.*}"
-
-# Create temporary directory for cache files: add .temp suffix to output path
 TMP_DIR="${OUTPUT_PATH}.temp"
 mkdir -p "$TMP_DIR"
 STATE_FILE="$TMP_DIR/${OUTPUT_NAME}_state.txt"
+PLAYLIST_CACHE="$TMP_DIR/playlist_url.txt"
 MAX_RETRIES=10
 
-# Initialize total size counter (in bytes)
+# 1) Resume state
 TOTAL_BYTES=0
-
-# Resume progress if state file exists
 COMPLETED_FILES=0
 if [[ -f "$STATE_FILE" ]]; then
-    COMPLETED_FILES=$(cat "$STATE_FILE")
+    COMPLETED_FILES=$(<"$STATE_FILE")
     echo "Resuming from file #$COMPLETED_FILES..."
-    # Sum sizes of already-downloaded segments
     for ((i=1; i<=COMPLETED_FILES; i++)); do
-        PART_FILE="$TMP_DIR/${OUTPUT_NAME}_part_${i}.ts"
-        if [[ -f "$PART_FILE" ]]; then
-            SIZE=$(stat -c%s "$PART_FILE" 2>/dev/null || stat -f%z "$PART_FILE")
-            TOTAL_BYTES=$((TOTAL_BYTES + SIZE))
-        fi
+        f="$TMP_DIR/${OUTPUT_NAME}_part_${i}.ts"
+        [[ -f "$f" ]] && TOTAL_BYTES=$((TOTAL_BYTES + $(stat -c%s "$f" 2>/dev/null || stat -f%z "$f")))
     done
-    TOTAL_MB=$((TOTAL_BYTES / 1024 / 1024))
-    echo "Already downloaded: ${TOTAL_MB}MB across $COMPLETED_FILES files."
+    echo "Already downloaded: $((TOTAL_BYTES/1024/1024))MB in $COMPLETED_FILES files."
 else
     echo "Starting fresh download..."
     echo "0" > "$STATE_FILE"
 fi
 
-# Fetch playlist and allow resolution selection if this is a master playlist
-echo "Fetching playlist..."
-MASTER_CONTENT=$(curl -s "$URL" | tr -d '\r')
-if echo "$MASTER_CONTENT" | grep -q "#EXT-X-STREAM-INF"; then
-    echo "Detected master playlist. Available resolutions:"
-    declare -a res_array url_array
-    idx=0
-    while IFS= read -r line; do
-        line=$(echo "$line" | tr -d '\r')
-        if [[ $line == \#EXT-X-STREAM-INF* ]]; then
-            res_array[idx]=$(echo "$line" | sed -nE 's/.*RESOLUTION=([^,]*).*/\1/p')
-            read -r next_line
-            next_line=$(echo "$next_line" | tr -d '\r')
-            url_array[idx]="$next_line"
-            idx=$((idx+1))
-        fi
-    done <<< "$MASTER_CONTENT"
-    for i in "${!res_array[@]}"; do
-        echo "$((i+1)): ${res_array[i]}"
-    done
-    echo -n "Enter your choice: "
-    read choice
-    if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice<1 || choice>${#res_array[@]} )); then
-        echo "Invalid choice. Exiting."
-        exit 1
-    fi
-    sel=$((choice-1))
-    PLAYLIST_URL="${url_array[sel]}"
-    # Resolve relative URLs
-    if [[ "$PLAYLIST_URL" != http* ]]; then
-        if [[ "$PLAYLIST_URL" == /* ]]; then
-            BASE=$(echo "$URL" | sed -E 's|(https?://[^/]+).*|\1|')
-            PLAYLIST_URL="$BASE$PLAYLIST_URL"
-        else
-            PLAYLIST_URL="$(dirname "$URL")/$PLAYLIST_URL"
-        fi
-    fi
-    echo "Selected resolution: ${res_array[sel]} -> $PLAYLIST_URL"
+# 2) Determine playlist URL (cache on first run)
+if [[ -f "$PLAYLIST_CACHE" ]]; then
+    PLAYLIST_URL=$(<"$PLAYLIST_CACHE")
+    echo "Using cached playlist: $PLAYLIST_URL"
 else
-    PLAYLIST_URL="$URL"
+    echo "Fetching playlist..."
+    MASTER_CONTENT=$(curl -s "$URL" | tr -d '\r')
+    if grep -q "#EXT-X-STREAM-INF" <<<"$MASTER_CONTENT"; then
+        echo "Detected master playlist. Available resolutions:"
+        declare -a res_array url_array; idx=0
+        while IFS= read -r line; do
+            line=${line//$'\r'/}
+            if [[ $line == \#EXT-X-STREAM-INF* ]]; then
+                res_array[idx]=$(sed -nE 's/.*RESOLUTION=([^,]*).*/\1/p' <<<"$line")
+                read -r next_line
+                url_array[idx]=${next_line//$'\r'/}
+                idx=$((idx+1))
+            fi
+        done <<<"$MASTER_CONTENT"
+        for i in "${!res_array[@]}"; do
+            echo "  $((i+1)): ${res_array[i]}"
+        done
+        read -p "Enter your choice: " choice
+        if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice<1 || choice>${#res_array[@]} )); then
+            echo "Invalid choice."; exit 1
+        fi
+        sel=$((choice-1))
+        PLAYLIST_URL="${url_array[sel]}"
+        # Resolve relative
+        if [[ "$PLAYLIST_URL" != http* ]]; then
+            if [[ "$PLAYLIST_URL" == /* ]]; then
+                BASE=$(sed -E 's|(https?://[^/]+).*|\1|' <<<"$URL")
+                PLAYLIST_URL="$BASE$PLAYLIST_URL"
+            else
+                PLAYLIST_URL="$(dirname "$URL")/$PLAYLIST_URL"
+            fi
+        fi
+    else
+        PLAYLIST_URL="$URL"
+    fi
+    echo "$PLAYLIST_URL" > "$PLAYLIST_CACHE"
+    echo "Playlist set to: $PLAYLIST_URL"
 fi
 
-echo "Fetching TS file URLs from playlist..."
+# 3) Fetch TS URLs
 TS_URLS=$(curl -s "$PLAYLIST_URL" | tr -d '\r' | grep -v '^#')
-TOTAL_FILES=$(echo "$TS_URLS" | wc -l)
-echo "Found $TOTAL_FILES TS files in the playlist."
+TOTAL_FILES=$(wc -l <<<"$TS_URLS")
+echo "Found $TOTAL_FILES TS files."
 
-echo "Starting download of $TOTAL_FILES files..."
+# 4) Download loop
 declare -a TS_FILES
 CURRENT_FILE=0
-for TS_URL in $TS_URLS; do
-    # Build absolute URL if needed
-    if [[ "$TS_URL" != http* ]]; then
-        if [[ "$TS_URL" == /* ]]; then
-            BASE=$(echo "$PLAYLIST_URL" | sed -E 's|(https?://[^/]+).*|\1|')
-            TS_URL="$BASE$TS_URL"
+for TS in $TS_URLS; do
+    # make absolute if needed
+    if [[ "$TS" != http* ]]; then
+        if [[ "$TS" == /* ]]; then
+            BASE=$(sed -E 's|(https?://[^/]+).*|\1|' <<<"$PLAYLIST_URL")
+            TS="$BASE$TS"
         else
-            TS_URL="$(dirname "$PLAYLIST_URL")/$TS_URL"
+            TS="$(dirname "$PLAYLIST_URL")/$TS"
         fi
     fi
     CURRENT_FILE=$((CURRENT_FILE+1))
+    OUT="$TMP_DIR/${OUTPUT_NAME}_part_${CURRENT_FILE}.ts"
     if (( CURRENT_FILE <= COMPLETED_FILES )); then
-        printf "\rProgress: %3d%% | Files: %d/%d | Total: %dMB" \
-          $((COMPLETED_FILES*100/TOTAL_FILES)) $CURRENT_FILE $TOTAL_FILES $((TOTAL_BYTES/1024/1024))
-        TS_FILES+=("$TMP_DIR/${OUTPUT_NAME}_part_${CURRENT_FILE}.ts")
+        printf "\rSkipping %4d/%4d (already have it)" $CURRENT_FILE $TOTAL_FILES
+        TS_FILES+=("$OUT")
         continue
     fi
-    TEMP_FILE="$TMP_DIR/${OUTPUT_NAME}_part_${CURRENT_FILE}.ts"
-
-    # Download segment
-    ATTEMPT=0; SUCCESS=0
-    while (( ATTEMPT < MAX_RETRIES )); do
-        ((ATTEMPT++))
-        curl -s "$TS_URL" --output "$TEMP_FILE"
-        [[ $? -eq 0 && -s "$TEMP_FILE" ]] && { SUCCESS=1; break; }
+    # download with retries
+    for ((a=1; a<=MAX_RETRIES; a++)); do
+        curl -s "$TS" -o "$OUT" && [[ -s "$OUT" ]] && break
+        [[ $a -eq $MAX_RETRIES ]] && echo -e "\nFailed segment $CURRENT_FILE" && break
     done
-    if (( SUCCESS != 1 )); then
-        echo "\nFailed to download segment $CURRENT_FILE after $MAX_RETRIES attempts. Skipping."
-        continue
-    fi
-
-    # Track downloaded bytes and update state
-    FILE_BYTES=$(stat -c%s "$TEMP_FILE" 2>/dev/null || stat -f%z "$TEMP_FILE")
-    TOTAL_BYTES=$((TOTAL_BYTES + FILE_BYTES))
-    printf "\rProgress: %3d%% | Files: %d/%d | Last: %4dMB | Total: %dMB" \
-        $((CURRENT_FILE*100/TOTAL_FILES)) $CURRENT_FILE $TOTAL_FILES $((FILE_BYTES/1024/1024)) $((TOTAL_BYTES/1024/1024))
-
-    # Save state
+    # update progress
+    SZ=$(stat -c%s "$OUT" 2>/dev/null || stat -f%z "$OUT")
+    TOTAL_BYTES=$((TOTAL_BYTES+SZ))
+    printf "\rProgress: %3d%% | %4d/%4d | Last: %4dKB | Total: %4dMB" \
+      $((CURRENT_FILE*100/TOTAL_FILES)) $CURRENT_FILE $TOTAL_FILES $((SZ/1024)) $((TOTAL_BYTES/1024/1024))
     echo "$CURRENT_FILE" > "$STATE_FILE"
-
-    TS_FILES+=("$TEMP_FILE")
+    TS_FILES+=("$OUT")
 done
+echo
 
-# Ensure the final progress line ends with a newline
-echo ""
-
-# ── NEW CONCAT & MERGE SECTION ──
-echo "Generating concat list (just basenames) and merging..."
-
-pushd "$TMP_DIR" > /dev/null
-
-# Create a simple concat_list.txt with only TS filenames
+# 5) Concat & merge (Option A)
+echo "Combining segments..."
+pushd "$TMP_DIR" >/dev/null
 > concat_list.txt
 for seg in ${OUTPUT_NAME}_part_*.ts; do
-    echo "file '$seg'" >> concat_list.txt
-done
-
-# Run ffmpeg from inside the temp dir; output goes one level up
-ffmpeg -y -f concat -safe 0 \
-    -i concat_list.txt \
-    -c copy "../${OUTPUT_FILENAME}"
-
-popd > /dev/null
-# ────────────────────────────────
+    echo "file '$seg'"
+done >> concat_list.txt
+ffmpeg -y -f concat -safe 0 -i concat_list.txt -c copy "../${OUTPUT_FILENAME}"
+popd >/dev/null
 
 echo "Conversion finished: $OUTPUT_PATH"
 
-# Cleanup prompt
-echo -n "Delete temporary directory ($TMP_DIR)? (y/N): "
-read resp
+# 6) Cleanup
+read -p "Delete temp dir ($TMP_DIR)? (y/N): " resp
 if [[ "$resp" =~ ^[Yy]$ ]]; then
     rm -rf "$TMP_DIR"
-    echo "Temporary directory removed."
+    echo "Cleaned up."
 else
-    echo "Temporary directory retained at: $TMP_DIR"
+    echo "Temp retained at $TMP_DIR"
 fi
 
-echo "Process finished."
+echo "Done."
