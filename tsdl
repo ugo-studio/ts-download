@@ -1,7 +1,6 @@
 #!/bin/bash
 # tsdl - Download TS segments from an HLS playlist and combine them into a video,
-#       while tracking and displaying the total downloaded size in-place,
-#       and skipping any corrupt or unreadable segments.
+#       while tracking and displaying the total downloaded size in-place.
 
 # Usage: tsdl <URL> [output_file_path]
 if [[ -z "$1" ]]; then
@@ -45,6 +44,7 @@ if [[ -f "$STATE_FILE" ]]; then
     for ((i=1; i<=COMPLETED_FILES; i++)); do
         f="$TMP_DIR/${OUTPUT_NAME}_part_${i}.ts"
         [[ -f "$f" ]] && TOTAL_BYTES=$((TOTAL_BYTES + $(stat -c%s "$f" 2>/dev/null || stat -f%z "$f")))
+        # Update progress bar
         TOTAL_MB=$((TOTAL_BYTES / 1024 / 1024))
         printf "\rCalculating total segment size: %4dMB in %4d files\r" $TOTAL_MB $COMPLETED_FILES
     done
@@ -82,6 +82,7 @@ else
         fi
         sel=$((choice-1))
         PLAYLIST_URL="${url_array[sel]}"
+        # Resolve relative
         if [[ "$PLAYLIST_URL" != http* ]]; then
             if [[ "$PLAYLIST_URL" == /* ]]; then
                 BASE=$(sed -E 's|(https?://[^/]+).*|\1|' <<<"$URL")
@@ -102,10 +103,18 @@ TS_URLS=$(curl -s "$PLAYLIST_URL" | tr -d '\r' | grep -v '^#')
 TOTAL_FILES=$(wc -l <<<"$TS_URLS")
 echo "Found $TOTAL_FILES TS files."
 
+# Check if ffprobe is installed
+if ! command -v ffprobe &> /dev/null; then
+    echo "Error: ffprobe is not installed. It is required to verify segments."
+    echo "Please install ffmpeg (which includes ffprobe)."
+    exit 1
+fi
+
 # 4) Download loop
 declare -a TS_FILES
 CURRENT_FILE=0
 for TS in $TS_URLS; do
+    # make absolute if needed
     if [[ "$TS" != http* ]]; then
         if [[ "$TS" == /* ]]; then
             BASE=$(sed -E 's|(https?://[^/]+).*|\1|' <<<"$PLAYLIST_URL")
@@ -121,45 +130,120 @@ for TS in $TS_URLS; do
         TS_FILES+=("$OUT")
         continue
     fi
+    # download with retries
     for ((a=1; a<=MAX_RETRIES; a++)); do
         curl -s "$TS" -o "$OUT" && [[ -s "$OUT" ]] && break
         [[ $a -eq $MAX_RETRIES ]] && echo -e "\nFailed segment $CURRENT_FILE" && break
     done
-    SZ=$(stat -c%s "$OUT" 2>/dev/null || stat -f%z "$OUT")
-    TOTAL_BYTES=$((TOTAL_BYTES+SZ))
-    printf "\rProgress: %3d%% | %4d/%4d | Last: %4dKB | Total: %4dMB" \
-      $((CURRENT_FILE*100/TOTAL_FILES)) $CURRENT_FILE $TOTAL_FILES $((SZ/1024)) $((TOTAL_BYTES/1024/1024))
-    echo "$CURRENT_FILE" > "$STATE_FILE"
-    TS_FILES+=("$OUT")
+    # update progress
+    # Check if the file exists and is not empty before trying to get its size
+    if [[ -f "$OUT" && -s "$OUT" ]]; then
+        SZ=$(stat -c%s "$OUT" 2>/dev/null || stat -f%z "$OUT")
+        TOTAL_BYTES=$((TOTAL_BYTES+SZ))
+        printf "\rProgress: %3d%% | %4d/%4d | Last: %4dKB | Total: %4dMB" \
+          $((CURRENT_FILE*100/TOTAL_FILES)) $CURRENT_FILE $TOTAL_FILES $((SZ/1024)) $((TOTAL_BYTES/1024/1024))
+        echo "$CURRENT_FILE" > "$STATE_FILE"
+        TS_FILES+=("$OUT") # Add to array regardless of size for later validation
+    else
+         echo -e "\nWarning: Download failed or resulted in an empty file for segment $CURRENT_FILE: $OUT"
+         # Do NOT update state file or total bytes for failed/empty download
+         # The file might still be created (empty), so it will be caught by ffprobe check later
+    fi
 done
 echo
 
-# 5) Concat & merge with skipping of bad segments
+# 5) Concat & merge (Option A)
 echo "Combining segments..."
 pushd "$TMP_DIR" >/dev/null
 
+# Create a properly version‐sorted concat list, skipping problematic files
 > concat_list.txt
-for seg in $(ls -1v ${OUTPUT_NAME}_part_*.ts); do
-    # Skip empty files outright
-    if [[ ! -s "$seg" ]]; then
-        echo "Warning: skipping empty segment $seg"
-        continue
-    fi
+problematic_files=() # Array to store names of problematic files
 
-    # Probe with ffprobe; only keep if it exits cleanly
-    if ffprobe -v error -i "$seg" -f null - 2>/dev/null; then
-        echo "file '$seg'" >> concat_list.txt
-    else
-        echo "Warning: skipping unreadable segment $seg"
+# Get the sorted list of segments that were intended to be downloaded
+# Using the TS_FILES array built during the download loop to maintain order and account for skipped files
+# Filter the array to only include files that actually exist in the temporary directory
+EXISTING_TS_FILES=()
+for f in "${TS_FILES[@]}"; do
+    if [[ -f "$f" ]]; then
+        EXISTING_TS_FILES+=("$f")
     fi
 done
+
+if [ ${#EXISTING_TS_FILES[@]} -eq 0 ]; then
+    echo "Error: No segment files found in the temporary directory to concatenate."
+    popd >/dev/null
+    # 6) Cleanup (Optional)
+    read -p "Delete temp dir ($TMP_DIR)? (y/N): " resp
+    if [[ "$resp" =~ ^[Yy]$ ]]; then
+        rm -rf "$TMP_DIR"
+        echo "Cleaned up."
+    else
+        echo "Temp retained at $TMP_DIR"
+    fi
+    echo "Done."
+    exit 1
+fi
+
+echo "Verifying segment files before creating concat list..."
+
+# Iterate through the existing segments in their intended order
+for seg in "${EXISTING_TS_FILES[@]}"; do
+    # Check if the file is readable by ffprobe (basic validity check)
+    # Redirect stderr to stdout and then to /dev/null to capture ffprobe's error output but discard it
+    if ffprobe -v error -i "$seg" >/dev/null 2>&1; then
+        # File seems okay, add it to the concat list
+        echo "file '$seg'" >> concat_list.txt
+    else
+        # ffprobe failed, file is likely corrupted or incomplete. Skip it.
+        echo "Warning: Skipping problematic segment '$seg'"
+        problematic_files+=("$(basename "$seg")") # Add base name to the list of skipped files
+    fi
+done
+
+# Check if concat_list.txt is empty after verification
+if [ ! -s concat_list.txt ]; then
+    echo "Error: No valid TS files found to concatenate after verification."
+    # Optional: Print the list of problematic files if any were found
+    if [ ${#problematic_files[@]} -gt 0 ]; then
+        echo "Problematic files skipped:"
+        printf " - %s\n" "${problematic_files[@]}"
+    fi
+    popd >/dev/null
+    # 6) Cleanup (Optional)
+    read -p "Delete temp dir ($TMP_DIR)? (y/N): " resp
+    if [[ "$resp" =~ ^[Yy]$ ]]; then
+        rm -rf "$TMP_DIR"
+        echo "Cleaned up."
+    else
+        echo "Temp retained at $TMP_DIR"
+    fi
+    echo "Done."
+    exit 1
+fi
+
+# Now merge:
+echo "Concatenating verified segments..."
+# Check if problematic files were skipped and report
+if [ ${#problematic_files[@]} -gt 0 ]; then
+    echo "Skipped ${#problematic_files[@]} problematic files during concatenation list creation."
+    echo "Skipped files: $(IFS=,; echo "${problematic_files[*]}")"
+fi
 
 ffmpeg -y -f concat -safe 0 \
     -i concat_list.txt \
     -c copy "../${OUTPUT_FILENAME}"
 
+# Check ffmpeg exit status
+FFMPEG_EXIT_STATUS=$?
 popd >/dev/null
-echo "Conversion finished: $OUTPUT_PATH"
+
+if [ $FFMPEG_EXIT_STATUS -eq 0 ]; then
+    echo "Conversion finished successfully: $OUTPUT_PATH"
+else
+    echo "Error: FFmpeg concatenation failed with exit status $FFMPEG_EXIT_STATUS."
+fi
+
 
 # 6) Cleanup
 read -p "Delete temp dir ($TMP_DIR)? (y/N): " resp
