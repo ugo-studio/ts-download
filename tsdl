@@ -1,6 +1,7 @@
 #!/bin/bash
 # tsdl - Download TS segments from an HLS playlist and combine them into a video,
-#       while tracking and displaying the total downloaded size in-place.
+#       while tracking and displaying the total downloaded size in-place,
+#       and skipping any corrupt or unreadable segments.
 
 # Usage: tsdl <URL> [output_file_path]
 if [[ -z "$1" ]]; then
@@ -44,7 +45,6 @@ if [[ -f "$STATE_FILE" ]]; then
     for ((i=1; i<=COMPLETED_FILES; i++)); do
         f="$TMP_DIR/${OUTPUT_NAME}_part_${i}.ts"
         [[ -f "$f" ]] && TOTAL_BYTES=$((TOTAL_BYTES + $(stat -c%s "$f" 2>/dev/null || stat -f%z "$f")))
-        # Update progress bar
         TOTAL_MB=$((TOTAL_BYTES / 1024 / 1024))
         printf "\rCalculating total segment size: %4dMB in %4d files\r" $TOTAL_MB $COMPLETED_FILES
     done
@@ -82,7 +82,6 @@ else
         fi
         sel=$((choice-1))
         PLAYLIST_URL="${url_array[sel]}"
-        # Resolve relative
         if [[ "$PLAYLIST_URL" != http* ]]; then
             if [[ "$PLAYLIST_URL" == /* ]]; then
                 BASE=$(sed -E 's|(https?://[^/]+).*|\1|' <<<"$URL")
@@ -107,7 +106,6 @@ echo "Found $TOTAL_FILES TS files."
 declare -a TS_FILES
 CURRENT_FILE=0
 for TS in $TS_URLS; do
-    # make absolute if needed
     if [[ "$TS" != http* ]]; then
         if [[ "$TS" == /* ]]; then
             BASE=$(sed -E 's|(https?://[^/]+).*|\1|' <<<"$PLAYLIST_URL")
@@ -123,12 +121,10 @@ for TS in $TS_URLS; do
         TS_FILES+=("$OUT")
         continue
     fi
-    # download with retries
     for ((a=1; a<=MAX_RETRIES; a++)); do
         curl -s "$TS" -o "$OUT" && [[ -s "$OUT" ]] && break
         [[ $a -eq $MAX_RETRIES ]] && echo -e "\nFailed segment $CURRENT_FILE" && break
     done
-    # update progress
     SZ=$(stat -c%s "$OUT" 2>/dev/null || stat -f%z "$OUT")
     TOTAL_BYTES=$((TOTAL_BYTES+SZ))
     printf "\rProgress: %3d%% | %4d/%4d | Last: %4dKB | Total: %4dMB" \
@@ -138,30 +134,31 @@ for TS in $TS_URLS; do
 done
 echo
 
-# 5) Concat & merge (Option A)
+# 5) Concat & merge with skipping of bad segments
 echo "Combining segments..."
 pushd "$TMP_DIR" >/dev/null
 
-# Create a properly version‐sorted concat list:
 > concat_list.txt
-# Option A: use ls -1v (version sort) if available
 for seg in $(ls -1v ${OUTPUT_NAME}_part_*.ts); do
-    echo "file '$seg'"
-done >> concat_list.txt
+    # Skip empty files outright
+    if [[ ! -s "$seg" ]]; then
+        echo "Warning: skipping empty segment $seg"
+        continue
+    fi
 
-# (Alternatively, fallback to sort -V on the glob list:
-# for seg in $(printf "%s\n" ${OUTPUT_NAME}_part_*.ts | sort -V); do
-#     echo "file '$seg'"
-# done >> concat_list.txt
-# )
+    # Probe with ffprobe; only keep if it exits cleanly
+    if ffprobe -v error -i "$seg" -f null - 2>/dev/null; then
+        echo "file '$seg'" >> concat_list.txt
+    else
+        echo "Warning: skipping unreadable segment $seg"
+    fi
+done
 
-# Now merge:
 ffmpeg -y -f concat -safe 0 \
     -i concat_list.txt \
     -c copy "../${OUTPUT_FILENAME}"
 
 popd >/dev/null
-
 echo "Conversion finished: $OUTPUT_PATH"
 
 # 6) Cleanup
