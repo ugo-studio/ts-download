@@ -43,12 +43,18 @@ if [[ -f "$STATE_FILE" ]]; then
     echo "Resuming from file #$COMPLETED_FILES..."
     for ((i=1; i<=COMPLETED_FILES; i++)); do
         f="$TMP_DIR/${OUTPUT_NAME}_part_${i}.ts"
-        [[ -f "$f" ]] && TOTAL_BYTES=$((TOTAL_BYTES + $(stat -c%s "$f" 2>/dev/null || stat -f%z "$f")))
+        # Check if the file exists before trying to get its size
+        if [[ -f "$f" ]]; then
+            SZ=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f")
+            TOTAL_BYTES=$((TOTAL_BYTES + SZ))
+        fi
         # Update progress bar
         TOTAL_MB=$((TOTAL_BYTES / 1024 / 1024))
-        printf "\rCalculating total segment size: %4dMB in %4d files\r" $TOTAL_MB $COMPLETED_FILES
+        printf "\rCalculating total segment size: %4dMB in %4d files" $TOTAL_MB $COMPLETED_FILES
     done
-    echo "Already downloaded: $((TOTAL_BYTES/1024/1024))MB in $COMPLETED_FILES files."
+    TOTAL_MB=$((TOTAL_BYTES / 1024 / 1024))
+    echo "Calculating total segment size: $(TOTAL_MB)MB in $COMPLETED_FILES files"  
+    echo "Already downloaded: $(TOTAL_MB)MB in $COMPLETED_FILES files."
 else
     echo "Starting fresh download..."
     echo "0" > "$STATE_FILE"
@@ -98,10 +104,10 @@ else
     echo "Playlist set to: $PLAYLIST_URL"
 fi
 
-# 3) Fetch TS URLs
+# 3) Fetch TS URLs (Used mainly for total count, download loop handles order based on playlist)
 TS_URLS=$(curl -s "$PLAYLIST_URL" | tr -d '\r' | grep -v '^#')
 TOTAL_FILES=$(wc -l <<<"$TS_URLS")
-echo "Found $TOTAL_FILES TS files."
+echo "Found $TOTAL_FILES TS files in playlist."
 
 # Check if ffprobe is installed
 if ! command -v ffprobe &> /dev/null; then
@@ -111,7 +117,8 @@ if ! command -v ffprobe &> /dev/null; then
 fi
 
 # 4) Download loop
-declare -a TS_FILES
+# The download loop will create files named _part_1.ts, _part_2.ts, etc.
+# The order is handled by processing the TS_URLS in sequence.
 CURRENT_FILE=0
 for TS in $TS_URLS; do
     # make absolute if needed
@@ -127,32 +134,42 @@ for TS in $TS_URLS; do
     OUT="$TMP_DIR/${OUTPUT_NAME}_part_${CURRENT_FILE}.ts"
     if (( CURRENT_FILE <= COMPLETED_FILES )); then
         printf "\rSkipping %4d/%4d (already have it)" $CURRENT_FILE $TOTAL_FILES
-        TS_FILES+=("$OUT")
+        # Even if skipping download, ensure the file exists for later ffprobe check
+        if [[ ! -f "$OUT" ]]; then
+             echo -e "\nWarning: Skipping download for segment $CURRENT_FILE, but file '$OUT' does not exist. It will be skipped in concatenation."
+        fi
         continue
     fi
     # download with retries
+    echo -e "\nDownloading segment $CURRENT_FILE/$TOTAL_FILES..."
     for ((a=1; a<=MAX_RETRIES; a++)); do
         curl -s "$TS" -o "$OUT" && [[ -s "$OUT" ]] && break
-        [[ $a -eq $MAX_RETRIES ]] && echo -e "\nFailed segment $CURRENT_FILE" && break
+        if [[ $a -eq $MAX_RETRIES ]]; then
+            echo -e "\nFailed to download segment $CURRENT_FILE: $TS"
+            # Do NOT update state file for failed download
+            # The file might still be created (empty or partial), which ffprobe will catch.
+        else
+            echo "Retry $a for segment $CURRENT_FILE..."
+            sleep 2 # wait a bit before retrying
+        fi
     done
-    # update progress
-    # Check if the file exists and is not empty before trying to get its size
+
+    # Update progress and state file only if download was attempted and successful (file exists and is not empty)
     if [[ -f "$OUT" && -s "$OUT" ]]; then
-        SZ=$(stat -c%s "$OUT" 2>/dev/null || stat -f%z "$OUT")
-        TOTAL_BYTES=$((TOTAL_BYTES+SZ))
-        printf "\rProgress: %3d%% | %4d/%4d | Last: %4dKB | Total: %4dMB" \
-          $((CURRENT_FILE*100/TOTAL_FILES)) $CURRENT_FILE $TOTAL_FILES $((SZ/1024)) $((TOTAL_BYTES/1024/1024))
-        echo "$CURRENT_FILE" > "$STATE_FILE"
-        TS_FILES+=("$OUT") # Add to array regardless of size for later validation
+         SZ=$(stat -c%s "$OUT" 2>/dev/null || stat -f%z "$OUT")
+         TOTAL_BYTES=$((TOTAL_BYTES+SZ))
+         printf "\rProgress: %3d%% | %4d/%4d | Last: %4dKB | Total: %4dMB" \
+           $((CURRENT_FILE*100/TOTAL_FILES)) $CURRENT_FILE $TOTAL_FILES $((SZ/1024)) $((TOTAL_BYTES/1024/1024))
+         echo "$CURRENT_FILE" > "$STATE_FILE"
     else
-         echo -e "\nWarning: Download failed or resulted in an empty file for segment $CURRENT_FILE: $OUT"
-         # Do NOT update state file or total bytes for failed/empty download
-         # The file might still be created (empty), so it will be caught by ffprobe check later
+         # If download failed or resulted in empty file, report it and don't update state/total
+         echo -e "\nWarning: Segment $CURRENT_FILE download failed or resulted in an empty file."
+         # ffprobe check later will handle this missing/invalid file.
     fi
 done
 echo
 
-# 5) Concat & merge (Option A)
+# 5) Concat & merge
 echo "Combining segments..."
 pushd "$TMP_DIR" >/dev/null
 
@@ -160,18 +177,17 @@ pushd "$TMP_DIR" >/dev/null
 > concat_list.txt
 problematic_files=() # Array to store names of problematic files
 
-# Get the sorted list of segments that were intended to be downloaded
-# Using the TS_FILES array built during the download loop to maintain order and account for skipped files
-# Filter the array to only include files that actually exist in the temporary directory
-EXISTING_TS_FILES=()
-for f in "${TS_FILES[@]}"; do
-    if [[ -f "$f" ]]; then
-        EXISTING_TS_FILES+=("$f")
-    fi
-done
+echo "Verifying segment files by filename order before creating concat list..."
 
-if [ ${#EXISTING_TS_FILES[@]} -eq 0 ]; then
-    echo "Error: No segment files found in the temporary directory to concatenate."
+# Use ls -1v to get the list of segment files in version-sorted order
+# The glob expansion ${OUTPUT_NAME}_part_*.ts will list files like
+# _part_1.ts, _part_2.ts, ..., _part_10.ts, etc.
+# ls -1v sorts these correctly numerically.
+# We use a loop over the output of ls -1v
+# Using 'while read -r seg' with 'ls -1v' handles filenames with spaces correctly.
+find_command="ls -1v ${OUTPUT_NAME}_part_*.ts"
+if ! eval "$find_command" > /dev/null 2>&1; then
+    echo "Error: No segment files found matching pattern '${OUTPUT_NAME}_part_*.ts' in $TMP_DIR."
     popd >/dev/null
     # 6) Cleanup (Optional)
     read -p "Delete temp dir ($TMP_DIR)? (y/N): " resp
@@ -185,21 +201,21 @@ if [ ${#EXISTING_TS_FILES[@]} -eq 0 ]; then
     exit 1
 fi
 
-echo "Verifying segment files before creating concat list..."
 
-# Iterate through the existing segments in their intended order
-for seg in "${EXISTING_TS_FILES[@]}"; do
-    # Check if the file is readable by ffprobe (basic validity check)
-    # Redirect stderr to stdout and then to /dev/null to capture ffprobe's error output but discard it
-    if ffprobe -v error -i "$seg" >/dev/null 2>&1; then
+eval "$find_command" | while read -r seg; do
+    # Check if the file exists (should always be true since ls lists existing files, but good practice)
+    # and is readable by ffprobe (basic validity check)
+    if [[ -f "$seg" ]] && ffprobe -v error -i "$seg" >/dev/null 2>&1; then
         # File seems okay, add it to the concat list
+        printf "\rAdded segment to list: '%s'\r\n" $seg
         echo "file '$seg'" >> concat_list.txt
     else
-        # ffprobe failed, file is likely corrupted or incomplete. Skip it.
-        echo "Warning: Skipping problematic segment '$seg'"
+        # ffprobe failed or file doesn't exist, skip it.
+        echo "Warning: Skipping problematic or missing segment '$seg'"
         problematic_files+=("$(basename "$seg")") # Add base name to the list of skipped files
     fi
 done
+
 
 # Check if concat_list.txt is empty after verification
 if [ ! -s concat_list.txt ]; then
@@ -242,6 +258,7 @@ if [ $FFMPEG_EXIT_STATUS -eq 0 ]; then
     echo "Conversion finished successfully: $OUTPUT_PATH"
 else
     echo "Error: FFmpeg concatenation failed with exit status $FFMPEG_EXIT_STATUS."
+    echo "The output file might be incomplete or corrupted due to skipped segments or other FFmpeg issues."
 fi
 
 
